@@ -11,7 +11,7 @@ use std::{
     hash::Hash,
     mem,
     pin::Pin,
-    sync::{Arc, RwLock, Weak},
+    sync::{Arc, RwLock},
 };
 
 use tokio::sync::SetOnce;
@@ -35,8 +35,23 @@ use type_id_map::TypeIdMap;
 /// - Sharing resources between [`Source::load`] implementations without contention or globals
 ///
 /// [next_task]: Self::next_task
-#[derive(Clone, Default)]
-pub struct Loader(Arc<LoaderShared>);
+#[derive(Clone)]
+pub struct Loader {
+    shared: Arc<LoaderShared>,
+    work_send: Option<async_channel::Sender<Task>>,
+}
+
+impl Default for Loader {
+    fn default() -> Self {
+        let (work_send, work_recv) = async_channel::unbounded();
+        let shared = Arc::new(LoaderShared {
+            work_send_weak: work_send.downgrade(),
+            work_recv,
+            cache: RwLock::default(),
+        });
+        Self { shared, work_send: Some(work_send) }
+    }
+}
 
 impl Loader {
     pub fn new() -> Self {
@@ -45,36 +60,39 @@ impl Loader {
 
     /// Begin loading `source`, immediately returning the [Asset] that will contain it
     pub fn load<S: Source>(&self, source: S) -> Asset<S::Output> {
-        let asset = self.0.create_asset::<S>();
+        let work_send = self.work_send.clone();
+        let asset = self.shared.create_asset::<S>(work_send);
         {
             let mut asset = CancelGuard(Some(asset.clone()));
-            // The channel is unbounded, so it can never become full. If the channel is closed, we
-            // silently drop the task.
-            _ = self.0.work_send.try_send(Task {
-                work: Box::new(move |context| {
-                    Box::pin(async move {
-                        let Some(data) = source.load(context).await else {
-                            return;
-                        };
-                        let asset = asset.0.take().unwrap();
-                        // Guaranteed to succeed because there are no other callers of `set`
-                        asset
-                            .0
-                            .data
-                            .set(Some(data))
-                            .unwrap_or_else(|_| unreachable!());
-                    })
-                }),
-            });
+            if let Some(work_send) = self.work_send.as_ref() {
+                // The channel is unbounded, so it can never become full. If the channel is closed, we
+                // silently drop the task.
+                _ = work_send.try_send(Task {
+                    work: Box::new(move |context| {
+                        Box::pin(async move {
+                            let Some(data) = source.load(context).await else {
+                                return;
+                            };
+                            let asset = asset.0.take().unwrap();
+                            // Guaranteed to succeed because there are no other callers of `set`
+                            asset
+                                .0
+                                .data
+                                .set(Some(data))
+                                .unwrap_or_else(|_| unreachable!());
+                        })
+                    }),
+                });
+            }
         }
         asset
     }
 
     pub fn load_cached<T: Source + Hash + Clone + Sync + Eq>(&self, key: T) -> Asset<T::Output> {
-        if let Some(x) = self.0.cache.read().unwrap().get(&TypeId::of::<T>()) {
+        if let Some(x) = self.shared.cache.read().unwrap().get(&TypeId::of::<T>()) {
             return self.load_cached_inner(key, &**x);
         }
-        match self.0.cache.write().unwrap().entry(TypeId::of::<T>()) {
+        match self.shared.cache.write().unwrap().entry(TypeId::of::<T>()) {
             hash_map::Entry::Occupied(e) => self.load_cached_inner(key, &**e.get()),
             hash_map::Entry::Vacant(e) => {
                 self.load_cached_inner(key, &**e.insert(Box::new(Cache::<T>::default())))
@@ -102,24 +120,34 @@ impl Loader {
     /// This future is cancel-safe, but see also [Task::run]. Yields `None` iff [close](Self::close)
     /// has been called.
     pub async fn next_task(&self) -> Option<Task> {
-        self.0.work_recv.recv().await.ok()
+        self.shared.work_recv.recv().await.ok()
     }
 
     /// Like [next_task](Self::next_task), except returning `None` immediately if no tasks are
     /// currently queued
     pub fn try_next_task(&self) -> Option<Task> {
-        self.0.work_recv.try_recv().ok()
+        self.shared.work_recv.try_recv().ok()
     }
 
-    /// Disable submission of new work, signaling callers of [next_task](Self::next_task) to shut
-    /// down
-    pub fn close(&self) {
-        self.0.work_send.close();
+    /// Disable submission of new work via this loader. Once all loaders are either dropped or closed,
+    /// and all existing assets have been dropped, callers of [next_task](Self::next_task) will be
+    /// signaled to shut down.
+    pub fn close(&mut self) {
+        self.work_send = None;
     }
 
-    /// Whether [close](Self::close) has been called
+    /// Immediately disable submission of all work, signaling callers of [next_task](Self::next_task)
+    /// to shut down. Note that this can cause resource leaks if some assets were partially loaded, or
+    /// if assets with a custom `free` function have not been dropped.
+    pub fn close_immediately(&self) {
+        if let Some(work_send) = self.shared.work_send_weak.upgrade() {
+            work_send.close();
+        }
+    }
+
+    /// Whether the channel has been closed, and no new work will be received
     pub fn is_closed(&self) -> bool {
-        self.0.work_recv.is_closed()
+        self.shared.work_recv.is_closed()
     }
 }
 
@@ -136,39 +164,18 @@ impl<T: Send + 'static> Drop for CancelGuard<T> {
 }
 
 struct LoaderShared {
-    work_send: async_channel::Sender<Task>,
+    work_send_weak: async_channel::WeakSender<Task>,
     work_recv: async_channel::Receiver<Task>,
     cache: RwLock<TypeIdMap<Box<dyn Any + Send + Sync>>>,
 }
 
 impl LoaderShared {
-    fn create_asset<S: Source>(self: &Arc<Self>) -> Asset<S::Output> {
-        let loader = Arc::downgrade(self);
+    fn create_asset<S: Source>(self: &Arc<Self>, work_send: Option<async_channel::Sender<Task>>) -> Asset<S::Output> {
         Asset(Arc::new(AssetShared {
             data: SetOnce::default(),
-            loader,
+            work_send,
             free_fn: S::free,
         }))
-    }
-
-    fn free<T: Send + 'static>(&self, x: T, f: fn(T, &Context)) {
-        _ = self.work_send.try_send(Task {
-            work: Box::new(move |ctx| {
-                f(x, ctx);
-                Box::pin(async {})
-            }),
-        });
-    }
-}
-
-impl Default for LoaderShared {
-    fn default() -> Self {
-        let (work_send, work_recv) = async_channel::unbounded();
-        Self {
-            work_send,
-            work_recv,
-            cache: RwLock::default(),
-        }
     }
 }
 
@@ -280,7 +287,7 @@ impl<T: Send + 'static> Clone for Asset<T> {
 
 struct AssetShared<T: Send + 'static> {
     data: SetOnce<Option<T>>,
-    loader: Weak<LoaderShared>,
+    work_send: Option<async_channel::Sender<Task>>,
     free_fn: fn(T, &Context),
 }
 
@@ -291,9 +298,17 @@ impl<T: Send + 'static> Drop for AssetShared<T> {
             // This asset was never loaded
             return;
         };
-        if let Some(loader) = self.loader.upgrade() {
-            loader.free(data, self.free_fn);
-        }
+        let Some(work_send) = self.work_send.as_ref() else {
+            // This asset never even began loading because the asset loader was already closed.
+            return;
+        };
+        let free_fn = self.free_fn;
+        _ = work_send.try_send(Task {
+            work: Box::new(move |ctx| {
+                free_fn(data, ctx);
+                Box::pin(async {})
+            }),
+        });
     }
 }
 
@@ -340,7 +355,7 @@ mod tests {
         assert!(loader.try_next_task().is_none());
         block_on(free_task.run(&Context::new()));
 
-        loader.close();
+        loader.close_immediately();
         assert!(loader.is_closed());
         assert!(block_on(loader.next_task()).is_none());
     }
