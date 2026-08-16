@@ -69,6 +69,10 @@ impl Loader {
                             .set(Some(data))
                             .unwrap_or_else(|_| unreachable!());
 
+                        loader_shared
+                            .live_asset_count
+                            .fetch_add(1, Ordering::Relaxed);
+
                         // We drop the `asset` before decreasing the task count. This ensures that if there are no
                         // external references to the asset, the task count increases before it decreases, allowing
                         // the asset to be freed without the active task count reaching 0.
@@ -108,6 +112,10 @@ impl Loader {
         }
     }
 
+    pub fn clear_cache(&self) {
+        self.0.cache.write().unwrap().clear();
+    }
+
     /// Yields a work item that should be ran on a background thread pool to make progress
     ///
     /// This future is cancel-safe, but see also [Task::run]. Yields `None` iff [close](Self::close)
@@ -138,10 +146,21 @@ impl Loader {
 
     /// Returns whether there are currently no active tasks running
     pub fn is_drained(&self) -> bool {
-        // We instantiate `_notified` to establish happens-before relationship, in case any callers of
-        // this function are relying on `is_drained` returning true in a way that requires such a relationship.
+        // We instantiate `_notified` to establish happens-before relationship, as we rely on this relationship
+        // to have the expected guarantees when `active_task_count` is 0.
         let _notified = self.0.drained.notified();
         self.0.active_task_count.load(Ordering::Relaxed) == 0
+    }
+
+    /// Whether all assets loaded by this Loader have been freed. Note that this method should be called after
+    /// the `Loader` is drained, as otherwise, new assets could be created that also need freeing after this method
+    /// returns `true`.
+    pub fn all_assets_freed(&self) -> bool {
+        // We use `Acquire` ordering to guarantee a happens-before relationship between the asset being
+        // freed and the `live_asset_count` being decremented, as this will help ensure that if this
+        // method returns true, as long as new assets aren't being loaded, there is guaranteed to be no
+        // unfreed assets.
+        self.0.live_asset_count.load(Ordering::Acquire) == 0
     }
 
     /// Disable submission of new work, signaling callers of [next_task](Self::next_task) to shut
@@ -178,6 +197,7 @@ struct LoaderShared {
     cache: RwLock<TypeIdMap<Box<dyn Any + Send + Sync>>>,
     active_task_count: AtomicUsize,
     drained: tokio::sync::Notify,
+    live_asset_count: AtomicUsize,
 }
 
 impl LoaderShared {
@@ -196,6 +216,10 @@ impl LoaderShared {
         _ = self.work_send.try_send(Task {
             work: Box::new(move |ctx| {
                 f(x, ctx);
+                // We use `Release` ordering to allow the guarantees of `Loader::all_assets_freed` to hold.
+                loader_shared
+                    .live_asset_count
+                    .fetch_sub(1, Ordering::Release);
                 loader_shared.decrement_active_task_count();
                 Box::pin(async {})
             }),
@@ -225,6 +249,7 @@ impl Default for LoaderShared {
             cache: RwLock::default(),
             active_task_count: AtomicUsize::new(0),
             drained: tokio::sync::Notify::new(),
+            live_asset_count: AtomicUsize::new(0),
         }
     }
 }
