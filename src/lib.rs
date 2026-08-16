@@ -11,23 +11,12 @@ use std::{
     hash::Hash,
     mem,
     pin::Pin,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, Weak},
 };
 
 use tokio::sync::SetOnce;
 
 use type_id_map::TypeIdMap;
-
-pub fn loader() -> (Loader, LoaderHandle) {
-    let (work_send, work_recv) = async_channel::unbounded();
-    (
-        Loader { shared: Arc::new(LoaderShared { work_recv }) },
-        LoaderHandle {
-            work_send,
-            cache: Arc::new(RwLock::default()),
-        },
-    )
-}
 
 /// Dispatches work to asynchronously populate [Asset] handles with data
 ///
@@ -46,21 +35,22 @@ pub fn loader() -> (Loader, LoaderHandle) {
 /// - Sharing resources between [`Source::load`] implementations without contention or globals
 ///
 /// [next_task]: Self::next_task
-#[derive(Clone)]
-pub struct LoaderHandle {
-    work_send: async_channel::Sender<Task>,
-    cache: Arc<RwLock<TypeIdMap<Box<dyn Any + Send + Sync>>>>,
-}
+#[derive(Clone, Default)]
+pub struct Loader(Arc<LoaderShared>);
 
-impl LoaderHandle {
+impl Loader {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Begin loading `source`, immediately returning the [Asset] that will contain it
     pub fn load<S: Source>(&self, source: S) -> Asset<S::Output> {
-        let asset = self.create_asset::<S>();
+        let asset = self.0.create_asset::<S>();
         {
             let mut asset = CancelGuard(Some(asset.clone()));
             // The channel is unbounded, so it can never become full. If the channel is closed, we
             // silently drop the task.
-            _ = self.work_send.try_send(Task {
+            _ = self.0.work_send.try_send(Task {
                 work: Box::new(move |context| {
                     Box::pin(async move {
                         let Some(data) = source.load(context).await else {
@@ -81,10 +71,10 @@ impl LoaderHandle {
     }
 
     pub fn load_cached<T: Source + Hash + Clone + Sync + Eq>(&self, key: T) -> Asset<T::Output> {
-        if let Some(x) = self.cache.read().unwrap().get(&TypeId::of::<T>()) {
+        if let Some(x) = self.0.cache.read().unwrap().get(&TypeId::of::<T>()) {
             return self.load_cached_inner(key, &**x);
         }
-        match self.cache.write().unwrap().entry(TypeId::of::<T>()) {
+        match self.0.cache.write().unwrap().entry(TypeId::of::<T>()) {
             hash_map::Entry::Occupied(e) => self.load_cached_inner(key, &**e.get()),
             hash_map::Entry::Vacant(e) => {
                 self.load_cached_inner(key, &**e.insert(Box::new(Cache::<T>::default())))
@@ -107,62 +97,29 @@ impl LoaderHandle {
         }
     }
 
-    /// Disable submission of new work, signaling callers of [next_task](Self::next_task) to shut
-    /// down
-    pub fn close(&self) {
-        self.work_send.close();
-    }
-
-    fn create_asset<S: Source>(&self) -> Asset<S::Output> {
-        Asset(Arc::new(AssetShared {
-            data: SetOnce::default(),
-            work_send: self.work_send.clone(),
-            free_fn: S::free,
-        }))
-    }
-}
-
-#[derive(Clone)]
-pub struct Loader {
-    shared: Arc<LoaderShared>,
-}
-
-impl Loader {
     /// Yields a work item that should be ran on a background thread pool to make progress
     ///
     /// This future is cancel-safe, but see also [Task::run]. Yields `None` iff [close](Self::close)
     /// has been called.
     pub async fn next_task(&self) -> Option<Task> {
-        self.shared.work_recv.recv().await.ok()
+        self.0.work_recv.recv().await.ok()
     }
 
     /// Like [next_task](Self::next_task), except returning `None` immediately if no tasks are
     /// currently queued
     pub fn try_next_task(&self) -> Option<Task> {
-        self.shared.work_recv.try_recv().ok()
+        self.0.work_recv.try_recv().ok()
     }
 
     /// Disable submission of new work, signaling callers of [next_task](Self::next_task) to shut
     /// down
     pub fn close(&self) {
-        self.shared.work_recv.close();
+        self.0.work_send.close();
     }
 
-    /// Whether [close](Self::close) has been called, or all senders have been dropped
+    /// Whether [close](Self::close) has been called
     pub fn is_closed(&self) -> bool {
-        self.shared.work_recv.is_closed()
-    }
-}
-
-struct LoaderShared {
-    work_recv: async_channel::Receiver<Task>,
-}
-
-impl Drop for LoaderShared {
-    fn drop(&mut self) {
-        // Drain the channel so any in-flight Assets get gracefully abandoned
-        self.work_recv.close();
-        while let Ok(_) = self.work_recv.try_recv() {}
+        self.0.work_recv.is_closed()
     }
 }
 
@@ -175,6 +132,51 @@ impl<T: Send + 'static> Drop for CancelGuard<T> {
         };
         // Notify consumers that this asset will never be loaded
         _ = asset.0.data.set(None);
+    }
+}
+
+struct LoaderShared {
+    work_send: async_channel::Sender<Task>,
+    work_recv: async_channel::Receiver<Task>,
+    cache: RwLock<TypeIdMap<Box<dyn Any + Send + Sync>>>,
+}
+
+impl LoaderShared {
+    fn create_asset<S: Source>(self: &Arc<Self>) -> Asset<S::Output> {
+        let loader = Arc::downgrade(self);
+        Asset(Arc::new(AssetShared {
+            data: SetOnce::default(),
+            loader,
+            free_fn: S::free,
+        }))
+    }
+
+    fn free<T: Send + 'static>(&self, x: T, f: fn(T, &Context)) {
+        _ = self.work_send.try_send(Task {
+            work: Box::new(move |ctx| {
+                f(x, ctx);
+                Box::pin(async {})
+            }),
+        });
+    }
+}
+
+impl Default for LoaderShared {
+    fn default() -> Self {
+        let (work_send, work_recv) = async_channel::unbounded();
+        Self {
+            work_send,
+            work_recv,
+            cache: RwLock::default(),
+        }
+    }
+}
+
+impl Drop for LoaderShared {
+    fn drop(&mut self) {
+        // Drain the channel so any in-flight Assets get gracefully abandoned
+        self.work_recv.close();
+        while let Ok(_) = self.work_recv.try_recv() {}
     }
 }
 
@@ -278,7 +280,7 @@ impl<T: Send + 'static> Clone for Asset<T> {
 
 struct AssetShared<T: Send + 'static> {
     data: SetOnce<Option<T>>,
-    work_send: async_channel::Sender<Task>,
+    loader: Weak<LoaderShared>,
     free_fn: fn(T, &Context),
 }
 
@@ -289,13 +291,9 @@ impl<T: Send + 'static> Drop for AssetShared<T> {
             // This asset was never loaded
             return;
         };
-        let free_fn = self.free_fn;
-        _ = self.work_send.try_send(Task {
-            work: Box::new(move |ctx| {
-                free_fn(data, ctx);
-                Box::pin(async {})
-            }),
-        });
+        if let Some(loader) = self.loader.upgrade() {
+            loader.free(data, self.free_fn);
+        }
     }
 }
 
@@ -327,8 +325,8 @@ mod tests {
 
     #[test]
     fn smoke() {
-        let (loader, loader_handle) = loader();
-        let asset = loader_handle.load(Trivial);
+        let loader = Loader::new();
+        let asset = loader.load(Trivial);
         assert!(asset.try_get().is_none());
 
         let load_task = loader.try_next_task().unwrap();
@@ -342,15 +340,15 @@ mod tests {
         assert!(loader.try_next_task().is_none());
         block_on(free_task.run(&Context::new()));
 
-        loader_handle.close();
+        loader.close();
         assert!(loader.is_closed());
         assert!(block_on(loader.next_task()).is_none());
     }
 
     #[test]
     fn abandoned_by_dropped_loader() {
-        let (loader, loader_handle) = loader();
-        let asset = loader_handle.load(Trivial);
+        let loader = Loader::new();
+        let asset = loader.load(Trivial);
         assert!(!asset.is_abandoned());
         drop(loader);
         assert!(asset.is_abandoned());
@@ -358,8 +356,8 @@ mod tests {
 
     #[test]
     fn abandoned_by_failed_load() {
-        let (loader, loader_handle) = loader();
-        let asset = loader_handle.load(Failed);
+        let loader = Loader::new();
+        let asset = loader.load(Failed);
         assert!(!asset.is_abandoned());
         let load_task = loader.try_next_task().unwrap();
         block_on(load_task.run(&Context::new()));
@@ -368,9 +366,9 @@ mod tests {
 
     #[test]
     fn cache() {
-        let (_loader, loader_handle) = loader();
-        let asset = loader_handle.load_cached(Trivial);
-        let asset2 = loader_handle.load_cached(Trivial);
+        let loader = Loader::new();
+        let asset = loader.load_cached(Trivial);
+        let asset2 = loader.load_cached(Trivial);
         assert!(Arc::ptr_eq(&asset.0, &asset2.0))
     }
 }
