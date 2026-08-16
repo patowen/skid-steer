@@ -381,6 +381,8 @@ impl<T: Send + 'static> Drop for AssetShared<T> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
     use pollster::block_on;
 
@@ -402,6 +404,26 @@ mod tests {
 
         async fn load<'a>(self, _: &'a Context<'_>) -> Option<()> {
             None
+        }
+    }
+
+    struct MustFree;
+
+    #[derive(Clone, Default)]
+    struct NumAliveCounter(Arc<Mutex<u32>>);
+
+    impl Source for MustFree {
+        type Output = ();
+
+        async fn load(self, context: &Context<'_>) -> Option<()> {
+            let num_alive = context.get::<NumAliveCounter>().unwrap();
+            *num_alive.0.lock().unwrap() += 1;
+            Some(())
+        }
+
+        fn free(_output: Self::Output, context: &Context) {
+            let num_alive = context.get::<NumAliveCounter>().unwrap();
+            *num_alive.0.lock().unwrap() -= 1;
         }
     }
 
@@ -452,5 +474,38 @@ mod tests {
         let asset = loader.load_cached(Trivial);
         let asset2 = loader.load_cached(Trivial);
         assert!(Arc::ptr_eq(&asset.0, &asset2.0))
+    }
+
+    #[test]
+    fn must_free() {
+        let loader = Loader::new();
+        let mut context = Context::new();
+        let num_alive_counter = NumAliveCounter::default();
+        context.insert(&num_alive_counter);
+        let asset = loader.load(MustFree);
+
+        assert!(!loader.is_drained());
+        assert!(loader.all_assets_freed());
+
+        let load_task = loader.try_next_task().unwrap();
+        assert!(loader.try_next_task().is_none());
+        block_on(load_task.run(&context));
+        assert!(asset.try_get().is_some());
+        assert_eq!(*num_alive_counter.0.lock().unwrap(), 1);
+
+        block_on(loader.drain());
+        assert!(loader.is_drained());
+        assert!(!loader.all_assets_freed());
+
+        drop(asset);
+        assert!(!loader.is_drained());
+        assert!(!loader.all_assets_freed());
+
+        let free_task = loader.try_next_task().unwrap();
+        assert!(loader.try_next_task().is_none());
+        block_on(free_task.run(&context));
+        assert!(loader.is_drained());
+        assert!(loader.all_assets_freed());
+        assert_eq!(*num_alive_counter.0.lock().unwrap(), 0);
     }
 }
