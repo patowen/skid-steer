@@ -11,7 +11,10 @@ use std::{
     hash::Hash,
     mem,
     pin::Pin,
-    sync::{Arc, RwLock, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, RwLock, Weak,
+    },
 };
 
 use tokio::sync::SetOnce;
@@ -48,6 +51,8 @@ impl Loader {
         let asset = self.0.create_asset::<S>();
         {
             let mut asset = CancelGuard(Some(asset.clone()));
+            let loader_shared = Arc::clone(&self.0);
+            loader_shared.increment_active_task_count();
             // The channel is unbounded, so it can never become full. If the channel is closed, we
             // silently drop the task.
             _ = self.0.work_send.try_send(Task {
@@ -63,6 +68,12 @@ impl Loader {
                             .data
                             .set(Some(data))
                             .unwrap_or_else(|_| unreachable!());
+
+                        // We drop the `asset` before decreasing the task count. This ensures that if there are no
+                        // external references to the asset, the task count increases before it decreases, allowing
+                        // the asset to be freed without the active task count reaching 0.
+                        drop(asset);
+                        loader_shared.decrement_active_task_count();
                     })
                 }),
             });
@@ -111,6 +122,28 @@ impl Loader {
         self.0.work_recv.try_recv().ok()
     }
 
+    /// Wait until there are currently no active tasks. Note that there may still be some assets
+    /// that need to be freed before it is safe to close the `Loader`.
+    pub async fn drain(&self) {
+        let notified = self.0.drained.notified();
+        if self.0.active_task_count.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+
+        // If `active_task_count` reached 0 at any point, we should consider the loader drained,
+        // as even if the `active_task_count` increases again, the `Loader` was indeed drained at some
+        // point since `drain` was called. Therefore, we do not need to check the atomic again in a loop.
+        notified.await
+    }
+
+    /// Returns whether there are currently no active tasks running
+    pub fn is_drained(&self) -> bool {
+        // We instantiate `_notified` to establish happens-before relationship, in case any callers of
+        // this function are relying on `is_drained` returning true in a way that requires such a relationship.
+        let _notified = self.0.drained.notified();
+        self.0.active_task_count.load(Ordering::Relaxed) == 0
+    }
+
     /// Disable submission of new work, signaling callers of [next_task](Self::next_task) to shut
     /// down
     pub fn close(&self) {
@@ -132,6 +165,10 @@ impl<T: Send + 'static> Drop for CancelGuard<T> {
         };
         // Notify consumers that this asset will never be loaded
         _ = asset.0.data.set(None);
+        // Decrement active task count, since the asset will never be loaded
+        if let Some(loader) = asset.0.loader.upgrade() {
+            loader.decrement_active_task_count()
+        }
     }
 }
 
@@ -139,6 +176,8 @@ struct LoaderShared {
     work_send: async_channel::Sender<Task>,
     work_recv: async_channel::Receiver<Task>,
     cache: RwLock<TypeIdMap<Box<dyn Any + Send + Sync>>>,
+    active_task_count: AtomicUsize,
+    drained: tokio::sync::Notify,
 }
 
 impl LoaderShared {
@@ -151,13 +190,29 @@ impl LoaderShared {
         }))
     }
 
-    fn free<T: Send + 'static>(&self, x: T, f: fn(T, &Context)) {
+    fn free<T: Send + 'static>(self: Arc<Self>, x: T, f: fn(T, &Context)) {
+        let loader_shared = Arc::clone(&self);
+        loader_shared.increment_active_task_count();
         _ = self.work_send.try_send(Task {
             work: Box::new(move |ctx| {
                 f(x, ctx);
+                loader_shared.decrement_active_task_count();
                 Box::pin(async {})
             }),
         });
+    }
+
+    fn increment_active_task_count(&self) {
+        self.active_task_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn decrement_active_task_count(&self) {
+        // Since `self.drained` sets up happens-before relationships, there should not be any need to
+        // use any ordering other than `Relaxed` for the count.
+        let old_count = self.active_task_count.fetch_sub(1, Ordering::Relaxed);
+        if old_count == 1 {
+            self.drained.notify_waiters();
+        }
     }
 }
 
@@ -168,6 +223,8 @@ impl Default for LoaderShared {
             work_send,
             work_recv,
             cache: RwLock::default(),
+            active_task_count: AtomicUsize::new(0),
+            drained: tokio::sync::Notify::new(),
         }
     }
 }
